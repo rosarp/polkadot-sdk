@@ -93,7 +93,7 @@ use sp_state_machine::{
 	StorageValue, UsageInfo as StateUsageInfo,
 };
 use sp_trie::{cache::SharedTrieCache, prefixed_key, MemoryDB, MerkleValue, PrefixedMemoryDB};
-use utils::BLOCK_GAP_CURRENT_VERSION;
+use utils::{BLOCK_GAP_CURRENT_VERSION, BODY_INDEX_CURRENT_VERSION};
 
 // Re-export the Database trait so that one can pass an implementation of it.
 pub use sc_state_db::PruningMode;
@@ -2267,6 +2267,15 @@ fn apply_index_ops<Block: BlockT>(
 				for hash in &hashes {
 					transaction.reference(columns::TRANSACTION, *hash);
 				}
+				// Mark the database as using the multi-renew schema. Pre-PR binaries
+				// cannot decode `MultiRenew` entries; setting the version here makes
+				// the incompatibility loud at the next backend open (via read_meta)
+				// rather than producing a cryptic "Unknown variant" mid-block-import.
+				transaction.set(
+					columns::META,
+					meta_keys::BODY_INDEX_VERSION,
+					&BODY_INDEX_CURRENT_VERSION.encode(),
+				);
 				DbExtrinsic::MultiRenew { hashes, extrinsic: encoded }
 			}
 		} else {
@@ -4853,6 +4862,136 @@ pub(crate) mod tests {
 		let indexed = bc.block_indexed_body(block1).unwrap().unwrap();
 		assert_eq!(indexed.len(), 1);
 		assert_eq!(&indexed[0][..], &x1[1..]);
+	}
+
+	#[test]
+	fn body_index_version_written_after_multi_renew() {
+		// When apply_index_ops emits a `MultiRenew` entry, it must also write
+		// `BODY_INDEX_VERSION = 1` to the META column. This makes the on-disk
+		// format change visible at backend open: a pre-PR binary attempting to
+		// read this DB hits a clear "Unsupported BODY_INDEX schema version" error
+		// in `read_meta` instead of a cryptic "Unknown variant" mid-block-import.
+		let backend = Backend::<Block>::new_test_with_tx_storage(BlocksPruning::Some(10), 10);
+
+		let x1 = UncheckedXt::new_transaction(0.into(), ()).encode();
+		let x2 = UncheckedXt::new_transaction(1.into(), ()).encode();
+		let x1_hash = <HashingFor<Block> as sp_core::Hasher>::hash(&x1[1..]);
+		let x2_hash = <HashingFor<Block> as sp_core::Hasher>::hash(&x2[1..]);
+
+		// Block 0: only single-Indexed inserts. Per-PR-format only — no version
+		// key should be written yet.
+		let block0 = insert_block(
+			&backend,
+			0,
+			Default::default(),
+			None,
+			Default::default(),
+			vec![
+				UncheckedXt::new_transaction(0.into(), ()),
+				UncheckedXt::new_transaction(1.into(), ()),
+			],
+			Some(vec![
+				IndexOperation::Insert {
+					extrinsic: 0,
+					hash: x1_hash.as_ref().to_vec(),
+					size: (x1.len() - 1) as u32,
+				},
+				IndexOperation::Insert {
+					extrinsic: 1,
+					hash: x2_hash.as_ref().to_vec(),
+					size: (x2.len() - 1) as u32,
+				},
+			]),
+		)
+		.unwrap();
+
+		// Pre-multi-renew: META should NOT have BODY_INDEX_VERSION set.
+		assert!(
+			backend
+				.storage
+				.db
+				.get(columns::META, utils::meta_keys::BODY_INDEX_VERSION)
+				.is_none(),
+			"BODY_INDEX_VERSION must remain unset until a MultiRenew is committed",
+		);
+
+		// Block 1: multi-renew (two hashes at the same extrinsic index). This
+		// produces a MultiRenew entry, which must trigger the version write.
+		let _block1 = insert_block(
+			&backend,
+			1,
+			block0,
+			None,
+			Default::default(),
+			vec![UncheckedXt::new_transaction(10.into(), ())],
+			Some(vec![
+				IndexOperation::Renew { extrinsic: 0, hash: x1_hash.as_ref().to_vec() },
+				IndexOperation::Renew { extrinsic: 0, hash: x2_hash.as_ref().to_vec() },
+			]),
+		)
+		.unwrap();
+
+		// Post-multi-renew: BODY_INDEX_VERSION must be present and equal to CURRENT.
+		let raw = backend
+			.storage
+			.db
+			.get(columns::META, utils::meta_keys::BODY_INDEX_VERSION)
+			.expect("BODY_INDEX_VERSION must be written when MultiRenew is committed");
+		let stored: u32 = Decode::decode(&mut &raw[..])
+			.expect("BODY_INDEX_VERSION must SCALE-decode to u32");
+		assert_eq!(
+			stored, BODY_INDEX_CURRENT_VERSION,
+			"stored version must match the current schema version constant",
+		);
+	}
+
+	#[test]
+	fn body_index_version_not_written_for_single_renew_only() {
+		// A database that only ever produces `Indexed` and `Full` entries (no
+		// MultiRenew) remains compatible with pre-PR binaries. The version key
+		// must NOT be written prematurely — that would unnecessarily mark the
+		// DB as v1-only when the on-disk format is still readable by older code.
+		let backend = Backend::<Block>::new_test_with_tx_storage(BlocksPruning::Some(10), 10);
+
+		let x1 = UncheckedXt::new_transaction(0.into(), ()).encode();
+		let x1_hash = <HashingFor<Block> as sp_core::Hasher>::hash(&x1[1..]);
+
+		// Insert.
+		let block0 = insert_block(
+			&backend,
+			0,
+			Default::default(),
+			None,
+			Default::default(),
+			vec![UncheckedXt::new_transaction(0.into(), ())],
+			Some(vec![IndexOperation::Insert {
+				extrinsic: 0,
+				hash: x1_hash.as_ref().to_vec(),
+				size: (x1.len() - 1) as u32,
+			}]),
+		)
+		.unwrap();
+
+		// Single-hash renewal — produces `Indexed` (backwards-compat), NOT MultiRenew.
+		let _block1 = insert_block(
+			&backend,
+			1,
+			block0,
+			None,
+			Default::default(),
+			vec![UncheckedXt::new_transaction(1.into(), ())],
+			Some(vec![IndexOperation::Renew { extrinsic: 0, hash: x1_hash.as_ref().to_vec() }]),
+		)
+		.unwrap();
+
+		assert!(
+			backend
+				.storage
+				.db
+				.get(columns::META, utils::meta_keys::BODY_INDEX_VERSION)
+				.is_none(),
+			"BODY_INDEX_VERSION must remain unset for DBs that only use Indexed/Full",
+		);
 	}
 
 	#[test]

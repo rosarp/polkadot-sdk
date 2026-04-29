@@ -45,6 +45,15 @@ pub const COLUMN_META: u32 = 0;
 /// Current block gap version.
 pub const BLOCK_GAP_CURRENT_VERSION: u32 = 1;
 
+/// Current `BODY_INDEX` schema version. Bumped when the on-disk SCALE encoding of
+/// `DbExtrinsic` gains a variant that pre-existing binaries cannot decode.
+///
+/// Version 1 introduces `DbExtrinsic::MultiRenew` for extrinsics that renew
+/// multiple indexed-data hashes within one call (PR #11474). The version key
+/// is only written when a `MultiRenew` entry is actually committed; databases
+/// that have never produced one remain readable by pre-PR binaries.
+pub const BODY_INDEX_CURRENT_VERSION: u32 = 1;
+
 /// Keys of entries in COLUMN_META.
 pub mod meta_keys {
 	/// Type of storage (full or light).
@@ -59,6 +68,9 @@ pub mod meta_keys {
 	pub const BLOCK_GAP: &[u8; 3] = b"gap";
 	/// Block gap version.
 	pub const BLOCK_GAP_VERSION: &[u8; 7] = b"gap_ver";
+	/// `BODY_INDEX` schema version. Set by `apply_index_ops` the first time a
+	/// `DbExtrinsic::MultiRenew` is committed. Validated at backend open.
+	pub const BODY_INDEX_VERSION: &[u8; 8] = b"bidx_ver";
 	/// Genesis block hash.
 	pub const GENESIS_HASH: &[u8; 3] = b"gen";
 	/// Leaves prefix list key.
@@ -555,6 +567,24 @@ where
 		},
 	};
 	debug!(target: "db", "block_gap={:?}", block_gap);
+
+	// Validate BODY_INDEX schema version. Pre-PR DBs and post-PR DBs that have
+	// never produced a multi-renew block have no version stored and remain
+	// readable. A future binary that writes a higher version triggers a loud,
+	// actionable error here at backend open — far better than the cryptic
+	// "Unknown variant" error that would otherwise surface mid-block-import.
+	match db
+		.get(COLUMN_META, meta_keys::BODY_INDEX_VERSION)
+		.and_then(|d| u32::decode(&mut d.as_slice()).ok())
+	{
+		None => {},
+		Some(v) if v <= BODY_INDEX_CURRENT_VERSION => {},
+		Some(v) =>
+			return Err(sp_blockchain::Error::Backend(format!(
+				"Unsupported BODY_INDEX schema version: {v} (this binary supports up to {BODY_INDEX_CURRENT_VERSION}). \
+				 The database was written by a newer client; upgrade to read it.",
+			))),
+	}
 
 	Ok(Meta {
 		best_hash,
